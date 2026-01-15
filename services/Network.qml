@@ -3,205 +3,178 @@ pragma Singleton
 import Quickshell
 import Quickshell.Io
 import QtQuick
-import qs.services
 
 Singleton {
     id: root
 
-    Component.onCompleted: {
-        // Trigger ethernet device detection after initialization
-        Qt.callLater(() => {
-            getEthernetDevices();
-        });
-        // Load saved connections on startup
-        Nmcli.loadSavedConnections(() => {
-            root.savedConnections = Nmcli.savedConnections;
-            root.savedConnectionSsids = Nmcli.savedConnectionSsids;
-        });
-        // Get initial WiFi status
-        Nmcli.getWifiStatus((enabled) => {
-            root.wifiEnabled = enabled;
-        });
-        // Sync networks from Nmcli on startup
-        Qt.callLater(() => {
-            syncNetworksFromNmcli();
-        }, 100);
-    }
+    // --- IMPORTANT: Network interface name set correctly ---
+    readonly property string interfaceName: "wlo1"
+    // -------------------------------------------------------
 
     readonly property list<AccessPoint> networks: []
     readonly property AccessPoint active: networks.find(n => n.active) ?? null
     property bool wifiEnabled: true
-    readonly property bool scanning: Nmcli.scanning
+    readonly property bool scanning: rescanProc.running
 
-    property list<var> ethernetDevices: []
-    readonly property var activeEthernet: ethernetDevices.find(d => d.connected) ?? null
-    property int ethernetDeviceCount: 0
-    property bool ethernetProcessRunning: false
-    property var ethernetDeviceDetails: null
-    property var wirelessDeviceDetails: null
+    /**
+     * Notification Service Helper
+     * Calls 'notify-send' to display system-level alerts.
+     */
+    function sendNotification(summary, body, icon = "network-wireless"): void {
+        notificationProc.exec(["notify-send", "-a", "WiFi Manager", "-i", icon, summary, body]);
+    }
 
     function enableWifi(enabled: bool): void {
-        Nmcli.enableWifi(enabled, (result) => {
-            if (result.success) {
-                root.getWifiStatus();
-                Nmcli.getNetworks(() => {
-                    syncNetworksFromNmcli();
-                });
-            }
-        });
+        const cmd = enabled ? "on" : "off";
+        enableWifiProc.exec(["nmcli", "radio", "wifi", cmd]);
+        
+        // Notify of state change
+        sendNotification("WiFi " + (enabled ? "Enabled" : "Disabled"), 
+                         "Wireless radio has been turned " + cmd);
     }
 
     function toggleWifi(): void {
-        Nmcli.toggleWifi((result) => {
-            if (result.success) {
-                root.getWifiStatus();
-                Nmcli.getNetworks(() => {
-                    syncNetworksFromNmcli();
-                });
-            }
-        });
+        enableWifi(!wifiEnabled);
     }
 
     function rescanWifi(): void {
-        Nmcli.rescanWifi();
+        if (!rescanProc.running) rescanProc.running = true;
     }
 
-    property var pendingConnection: null
-    signal connectionFailed(string ssid)
+    function connectToNetwork(ssid: string, password: string): void {
+        // Stop any previous connection process
+        connectProc.running = false;
 
-    function connectToNetwork(ssid: string, password: string, bssid: string, callback: var): void {
-        // Set up pending connection tracking if callback provided
-        if (callback) {
-            const hasBssid = bssid !== undefined && bssid !== null && bssid.length > 0;
-            root.pendingConnection = { ssid: ssid, bssid: hasBssid ? bssid : "", callback: callback };
+        console.log("[Wifi] Connecting to: " + ssid + " on " + root.interfaceName);
+        sendNotification("Connecting...", "Attempting to join " + ssid);
+
+        let args = ["nmcli", "device", "wifi", "connect", ssid];
+        
+        if (password && password.length > 0) {
+            args.push("password", password);
         }
         
-        Nmcli.connectToNetwork(ssid, password, bssid, (result) => {
-            if (result && result.success) {
-                // Connection successful
-                if (callback) callback(result);
-                root.pendingConnection = null;
-            } else if (result && result.needsPassword) {
-                // Password needed - callback will handle showing dialog
-                if (callback) callback(result);
-            } else {
-                // Connection failed
-                if (result && result.error) {
-                    root.connectionFailed(ssid);
-                }
-                if (callback) callback(result);
-                root.pendingConnection = null;
-            }
-        });
-    }
-
-    function connectToNetworkWithPasswordCheck(ssid: string, isSecure: bool, callback: var, bssid: string): void {
-        // Set up pending connection tracking
-        const hasBssid = bssid !== undefined && bssid !== null && bssid.length > 0;
-        root.pendingConnection = { ssid: ssid, bssid: hasBssid ? bssid : "", callback: callback };
-        
-        Nmcli.connectToNetworkWithPasswordCheck(ssid, isSecure, (result) => {
-            if (result && result.success) {
-                // Connection successful
-                if (callback) callback(result);
-                root.pendingConnection = null;
-            } else if (result && result.needsPassword) {
-                // Password needed - callback will handle showing dialog
-                if (callback) callback(result);
-            } else {
-                // Connection failed
-                if (result && result.error) {
-                    root.connectionFailed(ssid);
-                }
-                if (callback) callback(result);
-                root.pendingConnection = null;
-            }
-        }, bssid);
+        args.push("ifname", root.interfaceName);
+        connectProc.exec(args);
     }
 
     function disconnectFromNetwork(): void {
-        // Try to disconnect - use connection name if available, otherwise use device
-        Nmcli.disconnectFromNetwork();
-        // Refresh network list after disconnection
-        Qt.callLater(() => {
-            Nmcli.getNetworks(() => {
-                syncNetworksFromNmcli();
-            });
-        }, 500);
+        console.log("[Wifi] Disconnecting " + root.interfaceName);
+        disconnectProc.exec(["nmcli", "device", "disconnect", root.interfaceName]);
+        sendNotification("Disconnected", "Disconnected from WiFi network", "network-wireless-disconnected");
     }
 
-    function forgetNetwork(ssid: string): void {
-        // Delete the connection profile for this network
-        // This will remove the saved password and connection settings
-        Nmcli.forgetNetwork(ssid, (result) => {
-            if (result.success) {
-                // Refresh network list after deletion
-                Qt.callLater(() => {
-                    Nmcli.getNetworks(() => {
-                        syncNetworksFromNmcli();
-                    });
-                }, 500);
+    function getWifiStatus(): void {
+        wifiStatusProc.running = true;
+    }
+
+    // --- PROCESSES ---
+
+    // Dedicated process for notifications
+    Process {
+        id: notificationProc
+    }
+
+    Process {
+        id: getNetworks
+        running: true
+        command: ["nmcli", "-g", "ACTIVE,SIGNAL,FREQ,SSID,BSSID,SECURITY", "d", "w"]
+        environment: ({ LANG: "C.UTF-8", LC_ALL: "C.UTF-8" })
+        stdout: StdioCollector {
+            onStreamFinished: {
+                const lines = text.trim().split("\n");
+                const parsedMap = new Map();
+
+                lines.forEach(line => {
+                    let parts = line.replace(/\\:/g, "__COLON__").split(":");
+                    if (parts.length < 4) return;
+                    let ssid = parts[3]?.replace(/__COLON__/g, ":") ?? "";
+                    if (!ssid) return;
+
+                    let netObj = {
+                        active: parts[0] === "yes",
+                        strength: parseInt(parts[1]) || 0,
+                        frequency: parseInt(parts[2]) || 0,
+                        ssid: ssid,
+                        bssid: parts[4]?.replace(/__COLON__/g, ":") ?? "",
+                        security: parts[5] ?? ""
+                    };
+
+                    // Deduplication: Prioritize active network or strongest signal strength
+                    if (!parsedMap.has(ssid)) {
+                        parsedMap.set(ssid, netObj);
+                    } else {
+                        let existing = parsedMap.get(ssid);
+                        if (netObj.active) parsedMap.set(ssid, netObj);
+                        else if (!existing.active && netObj.strength > existing.strength) {
+                            parsedMap.set(ssid, netObj);
+                        }
+                    }
+                });
+
+                const finalNetworks = Array.from(parsedMap.values());
+                const currentList = root.networks;
+
+                // Remove outdated networks
+                const toRemove = currentList.filter(old => !finalNetworks.find(n => n.ssid === old.ssid));
+                toRemove.forEach(item => {
+                    let idx = currentList.indexOf(item);
+                    if (idx !== -1) currentList.splice(idx, 1);
+                    item.destroy();
+                });
+
+                // Add or update networks
+                finalNetworks.forEach(netData => {
+                    let match = currentList.find(n => n.ssid === netData.ssid);
+                    if (match) match.lastIpcObject = netData;
+                    else currentList.push(apComp.createObject(root, { lastIpcObject: netData }));
+                });
             }
-        });
-    }
-
-
-    property list<string> savedConnections: []
-    property list<string> savedConnectionSsids: []
-
-    // Sync saved connections from Nmcli when they're updated
-    Connections {
-        target: Nmcli
-        function onSavedConnectionsChanged() {
-            root.savedConnections = Nmcli.savedConnections;
-        }
-        function onSavedConnectionSsidsChanged() {
-            root.savedConnectionSsids = Nmcli.savedConnectionSsids;
         }
     }
 
-    function syncNetworksFromNmcli(): void {
-        const rNetworks = root.networks;
-        const nNetworks = Nmcli.networks;
-        
-        // Build a map of existing networks by key
-        const existingMap = new Map();
-        for (const rn of rNetworks) {
-            const key = `${rn.frequency}:${rn.ssid}:${rn.bssid}`;
-            existingMap.set(key, rn);
-        }
-        
-        // Build a map of new networks by key
-        const newMap = new Map();
-        for (const nn of nNetworks) {
-            const key = `${nn.frequency}:${nn.ssid}:${nn.bssid}`;
-            newMap.set(key, nn);
-        }
-        
-        // Remove networks that no longer exist
-        for (const [key, network] of existingMap) {
-            if (!newMap.has(key)) {
-                const index = rNetworks.indexOf(network);
-                if (index >= 0) {
-                    rNetworks.splice(index, 1);
-                    network.destroy();
-                }
-            }
-        }
-        
-        // Add or update networks from Nmcli
-        for (const [key, nNetwork] of newMap) {
-            const existing = existingMap.get(key);
-            if (existing) {
-                // Update existing network's lastIpcObject
-                existing.lastIpcObject = nNetwork.lastIpcObject;
+    Process {
+        id: connectProc
+        // Handle notification based on exit code
+        onExited: (exitCode) => {
+            getNetworks.running = true;
+            if (exitCode === 0) {
+                sendNotification("Connection Successful", "Connected to the network.", "network-wireless-connected");
             } else {
-                // Create new AccessPoint from Nmcli's data
-                rNetworks.push(apComp.createObject(root, {
-                    lastIpcObject: nNetwork.lastIpcObject
-                }));
+                sendNotification("Connection Failed", "Could not connect. Check credentials or signal.", "network-error");
             }
         }
+        stderr: StdioCollector {
+            onStreamFinished: { if (text.trim().length > 0) console.error("[Wifi Connect Error]: " + text); }
+        }
+    }
+
+    Process {
+        id: disconnectProc
+        stdout: SplitParser { onRead: getNetworks.running = true }
+        stderr: StdioCollector {
+            onStreamFinished: console.error("[Wifi Disconnect Error]: " + text)
+        }
+    }
+
+    Process {
+        id: wifiStatusProc
+        running: true
+        command: ["nmcli", "radio", "wifi"]
+        stdout: StdioCollector {
+            onStreamFinished: root.wifiEnabled = (text.trim() === "enabled")
+        }
+    }
+
+    Process {
+        id: enableWifiProc
+        onExited: { root.getWifiStatus(); getNetworks.running = true; }
+    }
+
+    Process {
+        id: rescanProc
+        command: ["nmcli", "dev", "wifi", "list", "--rescan", "yes"]
+        onExited: getNetworks.running = true
     }
 
     component AccessPoint: QtObject {
@@ -215,102 +188,5 @@ Singleton {
         readonly property bool isSecure: security.length > 0
     }
 
-    Component {
-        id: apComp
-        AccessPoint {}
-    }
-
-    function hasSavedProfile(ssid: string): bool {
-        // Use Nmcli's hasSavedProfile which has the same logic
-        return Nmcli.hasSavedProfile(ssid);
-    }
-
-    function getWifiStatus(): void {
-        Nmcli.getWifiStatus((enabled) => {
-            root.wifiEnabled = enabled;
-        });
-    }
-
-    function getEthernetDevices(): void {
-        root.ethernetProcessRunning = true;
-        Nmcli.getEthernetInterfaces((interfaces) => {
-            root.ethernetDevices = Nmcli.ethernetDevices;
-            root.ethernetDeviceCount = Nmcli.ethernetDevices.length;
-            root.ethernetProcessRunning = false;
-        });
-    }
-
-
-    function connectEthernet(connectionName: string, interfaceName: string): void {
-        Nmcli.connectEthernet(connectionName, interfaceName, (result) => {
-            if (result.success) {
-                getEthernetDevices();
-                // Refresh device details after connection
-                Qt.callLater(() => {
-                    const activeDevice = root.ethernetDevices.find(function(d) { return d.connected; });
-                    if (activeDevice && activeDevice.interface) {
-                        updateEthernetDeviceDetails(activeDevice.interface);
-                    }
-                }, 1000);
-            }
-        });
-    }
-
-    function disconnectEthernet(connectionName: string): void {
-        Nmcli.disconnectEthernet(connectionName, (result) => {
-            if (result.success) {
-                getEthernetDevices();
-                // Clear device details after disconnection
-                Qt.callLater(() => {
-                    root.ethernetDeviceDetails = null;
-                });
-            }
-        });
-    }
-
-    function updateEthernetDeviceDetails(interfaceName: string): void {
-        Nmcli.getEthernetDeviceDetails(interfaceName, (details) => {
-            root.ethernetDeviceDetails = details;
-        });
-    }
-
-    function updateWirelessDeviceDetails(): void {
-        // Find the wireless interface by looking for wifi devices
-        // Pass empty string to let Nmcli find the active interface automatically
-        Nmcli.getWirelessDeviceDetails("", (details) => {
-            root.wirelessDeviceDetails = details;
-        });
-    }
-
-    function cidrToSubnetMask(cidr: string): string {
-        // Convert CIDR notation (e.g., "24") to subnet mask (e.g., "255.255.255.0")
-        const cidrNum = parseInt(cidr);
-        if (isNaN(cidrNum) || cidrNum < 0 || cidrNum > 32) {
-            return "";
-        }
-
-        const mask = (0xffffffff << (32 - cidrNum)) >>> 0;
-        const octets = [
-            (mask >>> 24) & 0xff,
-            (mask >>> 16) & 0xff,
-            (mask >>> 8) & 0xff,
-            mask & 0xff
-        ];
-
-        return octets.join(".");
-    }
-
-    Process {
-        running: true
-        command: ["nmcli", "m"]
-        stdout: SplitParser {
-            onRead: {
-                Nmcli.getNetworks(() => {
-                    syncNetworksFromNmcli();
-                });
-                getEthernetDevices();
-            }
-        }
-    }
-
+    Component { id: apComp; AccessPoint {} }
 }
